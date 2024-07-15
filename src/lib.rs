@@ -54,8 +54,7 @@ where
     ///
     /// For calibration, a time source is needed to measure a timeout. Provide
     /// an implementation of [`ClockSource`], this could be time since program
-    /// start, or a realtime clock. On `std` this would be
-    /// [`std::time::Instant`] for example. This is also used to provide small
+    /// start, or a realtime clock. This is also used to provide small
     /// delays, seeing as we already have a time source.
     ///
     /// If these sensors are being used in an array, set all the xshut pins low
