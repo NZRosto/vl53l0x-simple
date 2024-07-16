@@ -1,4 +1,4 @@
-use crate::{reg::Register, ClockSource, InitialisationError, Vl53l0x};
+use crate::{reg::Register, InitialisationError, Vl53l0x};
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Clone, Copy)]
@@ -36,7 +36,7 @@ where
     #[allow(clippy::too_many_lines)]
     pub(crate) fn init(
         &mut self,
-        timer: &impl ClockSource,
+        delay: &mut impl embedded_hal::delay::DelayNs,
     ) -> Result<(), InitialisationError<EI2C, EX>> {
         // check model ID register (value specified in datasheet)
         let model_id = self
@@ -79,7 +79,7 @@ where
 
         // VL53L0X_StaticInit() begin
 
-        let (spad_count, spad_type_is_aperture) = self.get_spad_info(timer)?;
+        let (spad_count, spad_type_is_aperture) = self.get_spad_info(delay)?;
 
         // The SPAD map (RefGoodSpadMap) is read by VL53L0X_get_info_from_device() in
         // the API, but the same data seems to be more easily readable from
@@ -258,7 +258,7 @@ where
 
         self.write(Register::SystemSequenceConfig as u8, 0x01)
             .map_err(InitialisationError::I2C)?;
-        self.perform_single_ref_calibration(0x40, timer)?;
+        self.perform_single_ref_calibration(0x40, delay)?;
 
         // -- VL53L0X_perform_vhv_calibration() end
 
@@ -266,7 +266,7 @@ where
 
         self.write(Register::SystemSequenceConfig as u8, 0x02)
             .map_err(InitialisationError::I2C)?;
-        self.perform_single_ref_calibration(0x00, timer)?;
+        self.perform_single_ref_calibration(0x00, delay)?;
 
         // -- VL53L0X_perform_phase_calibration() end
 
@@ -372,7 +372,7 @@ where
 
     fn get_spad_info(
         &mut self,
-        timer: &impl ClockSource,
+        delay: &mut impl embedded_hal::delay::DelayNs,
     ) -> Result<(u8, bool), InitialisationError<EI2C, EX>> {
         self.write(0x80, 0x01).map_err(InitialisationError::I2C)?;
         self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
@@ -388,13 +388,11 @@ where
 
         self.write(0x94, 0x6b).map_err(InitialisationError::I2C)?;
         self.write(0x83, 0x00).map_err(InitialisationError::I2C)?;
-        let start_time: u32 = timer.get_ms();
-        while self.read(0x83).map_err(InitialisationError::I2C)? == 0x00 {
-            if (timer.get_ms() - start_time) > 500 {
-                // 500 ms
-                return Err(InitialisationError::CalibrationTimeout);
-            }
-        }
+
+        poll_timeout(delay, 500, || {
+            Ok(self.read(0x83).map_err(InitialisationError::I2C)? != 0x00)
+        })?;
+
         self.write(0x83, 0x01).map_err(InitialisationError::I2C)?;
         let tmp = self.read(0x92).map_err(InitialisationError::I2C)?;
 
@@ -604,24 +602,18 @@ where
     fn perform_single_ref_calibration(
         &mut self,
         vhv_init_byte: u8,
-        timer: &impl ClockSource,
+        delay: &mut impl embedded_hal::delay::DelayNs,
     ) -> Result<(), InitialisationError<EI2C, EX>> {
         self.write(Register::SysrangeStart as u8, 0x01 | vhv_init_byte)
             .map_err(InitialisationError::I2C)?; // VL53L0X_REG_SYSRANGE_MODE_START_STOP
 
-        let start_time: u32 = timer.get_ms();
-        #[allow(clippy::verbose_bit_mask)]
-        while (self
-            .read(Register::ResultInterruptStatus as u8)
-            .map_err(InitialisationError::I2C)?
-            & 0x07)
-            == 0
-        {
-            if (timer.get_ms() - start_time) > 500 {
-                // 500 ms
-                return Err(InitialisationError::CalibrationTimeout);
-            }
-        }
+        poll_timeout(delay, 500, || {
+            Ok((self
+                .read(Register::ResultInterruptStatus as u8)
+                .map_err(InitialisationError::I2C)?
+                & 0x07)
+                != 0)
+        })?;
 
         self.write(Register::SystemInterruptClear as u8, 0x01)
             .map_err(InitialisationError::I2C)?;
@@ -736,4 +728,25 @@ fn decode_timeout(reg_val: u16) -> u16 {
 
 fn decode_vcsel_period(reg_val: u8) -> u8 {
     ((reg_val) + 1) << 1
+}
+
+/// Poll a function until it returns true or a timeout is reached.
+fn poll_timeout<EI2C, EX>(
+    delay: &mut impl embedded_hal::delay::DelayNs,
+    timeout_ms: u32,
+    mut f: impl FnMut() -> Result<bool, InitialisationError<EI2C, EX>>,
+) -> Result<(), InitialisationError<EI2C, EX>> {
+    let mut counter = 0;
+    loop {
+        if f()? {
+            return Ok(());
+        }
+
+        if counter >= timeout_ms {
+            return Err(InitialisationError::Timeout);
+        }
+
+        delay.delay_ms(1);
+        counter += 1;
+    }
 }
